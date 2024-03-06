@@ -1,9 +1,15 @@
+import re
 import sqlite3
 import telebot
 from telebot import types
 from telegram_bot_calendar import DetailedTelegramCalendar, LSTEP
 from dotenv import load_dotenv
 import os
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from datetime import datetime
 
 load_dotenv()
@@ -11,9 +17,9 @@ bot = telebot.TeleBot(os.getenv("TELEGRAM_API_TOKEN"))
 
 values = None
 value_new = None
+flag = False
+ind = None
 
-
-# Функция для создания базы данных пользователя
 def create_user_reminders_table(user_id):
     conn = sqlite3.connect('reminders.db')
     c = conn.cursor()
@@ -21,8 +27,9 @@ def create_user_reminders_table(user_id):
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   description TEXT,
                   date TEXT,
-                  attachment_folder TEXT,
-                  done INTEGER DEFAULT 0)''')
+                  attachment_folder INTEGER DEFAULT 0,
+                  done INTEGER DEFAULT 0),
+                  period INTEGER DEFAULT 0''')
     conn.commit()
     conn.close()
 
@@ -82,19 +89,103 @@ def show_current_reminders(message):
     else:
         bot.send_message(message.chat.id, "У вас пока нет текущих дел.")
 
+# @bot.callback_query_handler(func=lambda call: call.data.startswith('edit_files'))
+# def edit_file_handler(call):
+#     user_id = call.from_user.id
+#     reminder_id = call.data.split('_')[2]  # Получаем идентификатор напоминания из данных вызова
+#     chat_id = call.message.chat.id
+#     bot.send_message(chat_id, "Чтобы отредактировать файл, отправьте новую версию файла.")
+#     attachment_table_name = f"attachments_{user_id}_{reminder_id}"
+#     file_id, save_path = get_file_info_from_database(attachment_table_name)
+#     service = connect_to_drive()
+#
+#     download_file_from_drive(service, file_id, save_path)
+#     print("Файл успешно загружен.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('edit_files'))
+def edit_files_handler(call):
+    user_id = call.from_user.id
+    reminder_id = call.data.split('_')[2]
+    chat_id = call.message.chat.id
+
+    attachment_table_name = f"attachments_{user_id}_{reminder_id}"
+    files_info = get_all_files_info_from_database(attachment_table_name)
+
+    if not files_info:
+        bot.send_message(chat_id, "Нет вложенных файлов для редактирования.")
+        return
+    keyboard = types.InlineKeyboardMarkup()
+    for file_id, file_path in files_info:
+        keyboard.row(
+            types.InlineKeyboardButton(f"Удалить {file_path}", callback_data=f"file_delete_{file_id}_{reminder_id}"),
+        )
+    keyboard.row(types.InlineKeyboardButton("Добавить вложение", callback_data=f"add_attachment_{reminder_id}"))
+
+    bot.send_message(chat_id, "Выберите файл для редактирования:", reply_markup=keyboard)
+
+
+def get_all_files_info_from_database(table_name):
+    conn = sqlite3.connect("reminders.db")
+    c = conn.cursor()
+    c.execute(f'''
+        SELECT file_path, file_name FROM {table_name}
+    ''')
+    file_info = c.fetchall()
+    conn.close()
+
+    return file_info
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('file_delete'))
+def delete_file_handler(call):
+    user_id = call.from_user.id
+    reminder_id = call.data.split('_')[-1]
+    file_id = call.data[12:-len(reminder_id)-1]
+    if delete_file_from_database(user_id, file_id, reminder_id):
+        bot.send_message(call.message.chat.id, f"Файл с ID {file_id} успешно удален.")
+    else:
+        bot.send_message(call.message.chat.id, f"Ошибка при удалении файла с ID {file_id}.")
+    delete_file_from_drive(file_id)
+
+
+def delete_file_from_database(user_id, file_id, reminder_id):
+    try:
+        conn = sqlite3.connect('reminders.db')
+        c = conn.cursor()
+        c.execute(f'''
+            DELETE FROM attachments_{user_id}_{reminder_id} WHERE file_path = ?
+        ''', (file_id,))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.Error as e:
+        print("Ошибка при удалении файла из базы данных:", e)
+        return False
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('add_attachment'))
+def add_attachment_handler(call):
+    global flag
+    global ind
+    flag = True
+    ind = call.data.split('_')[2]
+    print(ind)
+    bot.send_message(call.message.chat.id, "Добавление нового вложения. После загрузки введите end")
+
 
 @bot.callback_query_handler(lambda query: query.data.startswith("complete_"))
 def handle_complete_query(query):
     user_id = query.from_user.id
     reminder_id = int(query.data.split("_")[1])
-    mark_as_done(user_id, reminder_id)
+    mark_as(user_id, reminder_id)
     bot.send_message(query.message.chat.id, "Напоминание помечено как выполненное.")
 
 
-def mark_as_done(user_id, reminder_id):
+def mark_as(user_id, reminder_id, value=1):
     conn = sqlite3.connect('reminders.db')
     c = conn.cursor()
-    c.execute(f"UPDATE user_{user_id} SET done = 1 WHERE id = ?", (reminder_id,))
+    c.execute(f"UPDATE user_{user_id} SET done = ? WHERE id = ?", (value, reminder_id))
     conn.commit()
     conn.close()
 
@@ -108,11 +199,33 @@ def handle_delete_query(query):
 
 
 def delete_reminder(user_id, reminder_id):
-    conn = sqlite3.connect('reminders.db')
-    c = conn.cursor()
-    c.execute(f"DELETE FROM user_{user_id} WHERE id = ?", (reminder_id,))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect('reminders.db')
+        c = conn.cursor()
+
+        attachment_table_name = f"attachments_{user_id}_{reminder_id}"
+
+        c.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name=?", (attachment_table_name,))
+        table_exists = c.fetchone()
+
+        if table_exists:
+            c.execute(f"SELECT file_path FROM {attachment_table_name}")
+            file_ids = c.fetchall()
+
+            for file_id in file_ids:
+
+                delete_file_from_drive(file_id[0])
+
+            c.execute(f"DROP TABLE {attachment_table_name}")
+
+        c.execute(f"DELETE FROM user_{user_id} WHERE id = ?", (reminder_id,))
+
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.Error as e:
+        print("Ошибка при удалении напоминания из базы данных:", e)
+        return False
 
 
 @bot.callback_query_handler(lambda query: query.data.startswith("edit_description_"))
@@ -139,7 +252,6 @@ def update_description(user_id, reminder_id, new_description):
 
 @bot.callback_query_handler(lambda query: query.data.startswith("edit_date_"))
 def handle_edit_date_query(query):
-    global value_new
     user_id = query.from_user.id
     reminder_id = int(query.data.split("_")[2])
     calendar, step = DetailedTelegramCalendar().build()
@@ -173,12 +285,29 @@ def show_completed_reminders(message):
     user_id = message.from_user.id
     reminders = get_user_reminders(user_id, done=True)
     if reminders:
-        response = "Выполненные дела:\n"
         for reminder in reminders:
-            response += f"- {reminder[1]} ({reminder[2]})\n"
+            keyboard = types.InlineKeyboardMarkup()
+            keyboard.row(
+                types.InlineKeyboardButton("Вернуть с изменением даты", callback_data=f"return_{reminder[0]}")
+            )
+            bot.send_message(message.chat.id, f"Описание: {reminder[1]}, Дата: {reminder[2]}", reply_markup=keyboard)
     else:
-        response = "У вас пока нет выполненных дел."
-    bot.send_message(message.chat.id, response)
+        bot.send_message(message.chat.id, "У вас пока нет выполненных дел.")
+
+
+@bot.callback_query_handler(lambda query: query.data.startswith("return_"))
+def handle_return_query(query):
+    user_id = query.from_user.id
+    reminder_id = int(query.data.split("_")[1])
+    mark_as(user_id, reminder_id, 0)
+    calendar, step = DetailedTelegramCalendar().build()
+    msg = bot.send_message(query.message.chat.id, "Выберите новую дату:", reply_markup=calendar)
+    process_edit_date(msg, user_id, reminder_id)
+    bot.register_next_step_handler(msg, process_return)
+
+
+def process_return(message):
+    bot.send_message(message.chat.id, "Напоминание успешно возвращено с новой датой.")
 
 
 @bot.message_handler(commands=['start'])
@@ -269,49 +398,168 @@ def set_date(message, description, result):
                        telebot.types.InlineKeyboardButton("Нет", callback_data="attach_no"))
             bot.send_message(chat_id, f"Напоминание '{description}' успешно добавлено на {result}."
                                       "Хотите прикрепить вложения?", reply_markup=markup)
-            add_to_database(message.chat.id, description, result, None)
+            add_to_database(message.chat.id, description, result, 0)
         except Exception as e:
-            print(e)
             bot.send_message(message.chat.id, 'Ошибка выбора даты. Попробуйте еще раз.')
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('attach'))
 def handle_attachment(call):
+    global flag
     chat_id = call.message.chat.id
     if call.data == 'attach_yes':
-        bot.send_message(chat_id, "Отправьте мне нужные вложения.")
-
-        attachment_folder = "path/to/attachment/folder"
-        update_attachment_folder(chat_id, attachment_folder)
+        reminder_id = get_latest_reminder_id(chat_id)
+        create_attachments_table(chat_id, reminder_id)
+        flag = True
+        msg = bot.send_message(chat_id, "Отправьте мне нужные вложения. Затем введите end")
+        update_attachment_folder(chat_id, 1)
+        if msg.text == 'end':
+            flag = False
     elif call.data == 'attach_no':
         bot.send_message(chat_id, "Напоминание успешно создано!")
     bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
 
 
-@bot.message_handler(commands=['current'])
-def show_current_reminders(message):
-    user_id = message.from_user.id
-    reminders = get_user_reminders(user_id, done=False)
-    if reminders:
-        response = "Текущие дела:\n"
-        for reminder in reminders:
-            response += f"- {reminder[1]} ({reminder[2]})\n"
-    else:
-        response = "У вас пока нет текущих дел."
-    bot.send_message(message.chat.id, response)
+def get_last_reminder_id(chat_id):
+    conn = sqlite3.connect('reminders.db')
+    c = conn.cursor()
+    c.execute(f'''
+        SELECT id FROM user_{chat_id} ORDER BY id DESC LIMIT 1
+    ''')
+    last_reminder_id = c.fetchone()[0]
+    conn.close()
+    return last_reminder_id
 
 
-@bot.message_handler(commands=['completed'])
-def show_completed_reminders(message):
-    user_id = message.from_user.id
-    reminders = get_user_reminders(user_id, done=True)
-    if reminders:
-        response = "Выполненные дела:\n"
-        for reminder in reminders:
-            response += f"- {reminder[1]} ({reminder[2]})\n"
+def create_attachments_table(user_id, reminder_id):
+    table_name = f"attachments_{user_id}_{reminder_id}"
+    conn = sqlite3.connect('reminders.db')
+    c = conn.cursor()
+    c.execute(f'''
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_path TEXT NOT NULL,
+            file_name TEXT NOT NULL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
+SCOPES = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/drive.file"]
+
+
+def connect_to_drive():
+    creds = None
+    if os.path.exists("token.json"):
+        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                "credentials.json", SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+        with open("token.json", "w") as token:
+            token.write(creds.to_json())
+    service = build("drive", "v3", credentials=creds)
+    return service
+
+
+def upload_file_to_drive(service, file_path):
+    file_metadata = {"name": os.path.basename(file_path)}
+    media = MediaFileUpload(file_path, resumable=True)
+    file = (
+        service.files()
+        .create(body=file_metadata, media_body=media, fields="id")
+        .execute()
+    )
+    return file.get("id")
+
+
+def save_file_info_to_database(user_id, reminder_id, file_path, file_name):
+    table_name = f"attachments_{user_id}_{reminder_id}"
+    conn = sqlite3.connect('reminders.db')
+    c = conn.cursor()
+    c.execute(f'''
+        INSERT INTO {table_name} (file_path, file_name) VALUES (?, ?)
+    ''', (file_path, file_name))
+    conn.commit()
+    conn.close()
+
+
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    global flag
+    global ind
+    if flag:
+        user_id = message.from_user.id
+        if ind is not None:
+            reminder_id = ind
+        else:
+            reminder_id = get_latest_reminder_id(user_id)
+        service = connect_to_drive()
+        file_info = bot.get_file(message.document.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        file_path = f"{user_id}_{message.document.file_name}"
+        with open(file_path, 'wb') as new_file:
+            new_file.write(downloaded_file)
+        file_id = upload_file_to_drive(service, file_path)
+        save_file_info_to_database(user_id, reminder_id, file_id, f"{message.document.file_name}")
+        os.remove(file_path)
+
+
+def get_latest_reminder_id(user_id):
+    conn = sqlite3.connect('reminders.db')
+    c = conn.cursor()
+    c.execute("SELECT id FROM user_{} ORDER BY id DESC LIMIT 1".format(user_id))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0]
     else:
-        response = "У вас пока нет выполненных дел."
-    bot.send_message(message.chat.id, response)
+        return None
+
+
+def download_file_from_drive(service, file_id, save_path):
+    request = service.files().get_media(fileId=file_id)
+    fh = open(save_path, "wb")
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while done is False:
+        status, done = downloader.next_chunk()
+    fh.close()
+
+
+def delete_file_from_drive(file_id):
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+    service = build('drive', 'v3', credentials=creds)
+
+    try:
+        service.files().delete(fileId=file_id).execute()
+        print("Файл успешно удален с Google Диска.")
+    except Exception as e:
+        print("Ошибка при удалении файла с Google Диска:", e)
+
+
+@bot.message_handler(func=lambda message: message.text.lower() == 'end')
+def end_command_handler():
+    global flag
+    global ind
+    ind = None
+    flag = False
 
 
 def main():
@@ -319,7 +567,10 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception:
+        main()
 
 
 
