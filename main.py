@@ -10,6 +10,7 @@ load_dotenv()
 bot = telebot.TeleBot(os.getenv("TELEGRAM_API_TOKEN"))
 
 values = None
+value_new = None
 
 
 # Функция для создания базы данных пользователя
@@ -136,6 +137,37 @@ def update_description(user_id, reminder_id, new_description):
     conn.close()
 
 
+@bot.callback_query_handler(lambda query: query.data.startswith("edit_date_"))
+def handle_edit_date_query(query):
+    global value_new
+    user_id = query.from_user.id
+    reminder_id = int(query.data.split("_")[2])
+    calendar, step = DetailedTelegramCalendar().build()
+    msg = bot.send_message(query.message.chat.id, "Выберите новую дату:", reply_markup=calendar)
+    process_edit_date(msg, user_id, reminder_id)
+
+
+def process_edit_date(message, user_id, reminder_id):
+    global value_new
+    msg = bot.send_message(message.chat.id, "Теперь введите новое время (в формате ЧЧ:ММ):")
+    bot.register_next_step_handler(msg, lambda m: process_edit_time(m, user_id, reminder_id, value_new))
+
+
+def process_edit_time(message, user_id, reminder_id, new_date):
+    new_time = message.text
+    new_datetime = f"{new_date} {new_time}"
+    update_date(user_id, reminder_id, new_datetime)
+    bot.send_message(message.chat.id, "Дата и время успешно обновлены.")
+
+
+def update_date(user_id, reminder_id, new_date):
+    conn = sqlite3.connect('reminders.db')
+    c = conn.cursor()
+    c.execute(f"UPDATE user_{user_id} SET date = ? WHERE id = ?", (new_date, reminder_id))
+    conn.commit()
+    conn.close()
+
+
 @bot.message_handler(func=lambda message: message.text == 'Посмотреть список выполненных дел')
 def show_completed_reminders(message):
     user_id = message.from_user.id
@@ -166,6 +198,7 @@ def start(message):
 @bot.callback_query_handler(func=DetailedTelegramCalendar.func())
 def cal(c):
     global values
+    global value_new
     if c.message.text.startswith('Выберите дату для напоминания '):
         values = c.message.text[30:-1]
     result, key, step = DetailedTelegramCalendar().process(c.data)
@@ -178,8 +211,11 @@ def cal(c):
         bot.edit_message_text(f"Вы выбрали {result}",
                               c.message.chat.id,
                               c.message.message_id)
-        msg = bot.send_message(c.message.chat.id, f"Теперь выберите время:")
-        bot.register_next_step_handler(msg, set_time, result, values)
+        if values is not None:
+            msg = bot.send_message(c.message.chat.id, f"Теперь выберите время:")
+            bot.register_next_step_handler(msg, set_time, result, values)
+        else:
+            value_new = result
 
 
 def validate_time_format(time_str):
@@ -208,6 +244,8 @@ def set_time(message, chosen_date, text):
 
 @bot.message_handler(commands=['add'])
 def add_reminder(message):
+    global values
+    values = None
     msg = bot.send_message(message.chat.id, "Введите описание напоминания:")
     bot.register_next_step_handler(msg, set_description)
 
@@ -221,17 +259,20 @@ def set_description(message):
 
 
 def set_date(message, description, result):
-    try:
-        chat_id = message.chat.id
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.row(telebot.types.InlineKeyboardButton("Да", callback_data="attach_yes"),
-                   telebot.types.InlineKeyboardButton("Нет", callback_data="attach_no"))
-        bot.send_message(chat_id, f"Напоминание '{description}' успешно добавлено на {result}."
-                                  "Хотите прикрепить вложения?", reply_markup=markup)
-        add_to_database(message.chat.id, description, result, None)
-    except Exception as e:
-        print(e)
-        bot.send_message(message.chat.id, 'Ошибка выбора даты. Попробуйте еще раз.')
+    global values
+    values = None
+    if description is not None:
+        try:
+            chat_id = message.chat.id
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.row(telebot.types.InlineKeyboardButton("Да", callback_data="attach_yes"),
+                       telebot.types.InlineKeyboardButton("Нет", callback_data="attach_no"))
+            bot.send_message(chat_id, f"Напоминание '{description}' успешно добавлено на {result}."
+                                      "Хотите прикрепить вложения?", reply_markup=markup)
+            add_to_database(message.chat.id, description, result, None)
+        except Exception as e:
+            print(e)
+            bot.send_message(message.chat.id, 'Ошибка выбора даты. Попробуйте еще раз.')
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('attach'))
