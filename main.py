@@ -82,6 +82,60 @@ def show_current_reminders(message):
         bot.send_message(message.chat.id, "У вас пока нет текущих дел.")
 
 
+@bot.callback_query_handler(lambda query: query.data.startswith("complete_"))
+def handle_complete_query(query):
+    user_id = query.from_user.id
+    reminder_id = int(query.data.split("_")[1])
+    mark_as_done(user_id, reminder_id)
+    bot.send_message(query.message.chat.id, "Напоминание помечено как выполненное.")
+
+
+def mark_as_done(user_id, reminder_id):
+    conn = sqlite3.connect('reminders.db')
+    c = conn.cursor()
+    c.execute(f"UPDATE user_{user_id} SET done = 1 WHERE id = ?", (reminder_id,))
+    conn.commit()
+    conn.close()
+
+
+@bot.callback_query_handler(lambda query: query.data.startswith("delete_"))
+def handle_delete_query(query):
+    user_id = query.from_user.id
+    reminder_id = int(query.data.split("_")[1])
+    delete_reminder(user_id, reminder_id)
+    bot.send_message(query.message.chat.id, "Напоминание удалено.")
+
+
+def delete_reminder(user_id, reminder_id):
+    conn = sqlite3.connect('reminders.db')
+    c = conn.cursor()
+    c.execute(f"DELETE FROM user_{user_id} WHERE id = ?", (reminder_id,))
+    conn.commit()
+    conn.close()
+
+
+@bot.callback_query_handler(lambda query: query.data.startswith("edit_description_"))
+def handle_edit_description_query(query):
+    user_id = query.from_user.id
+    reminder_id = int(query.data.split("_")[2])
+    msg = bot.send_message(query.message.chat.id, "Введите новое описание:")
+    bot.register_next_step_handler(msg, lambda m: process_edit_description(m, user_id, reminder_id))
+
+
+def process_edit_description(message, user_id, reminder_id):
+    new_description = message.text
+    update_description(user_id, reminder_id, new_description)
+    bot.send_message(message.chat.id, "Описание успешно обновлено.")
+
+
+def update_description(user_id, reminder_id, new_description):
+    conn = sqlite3.connect('reminders.db')
+    c = conn.cursor()
+    c.execute(f"UPDATE user_{user_id} SET description = ? WHERE id = ?", (new_description, reminder_id))
+    conn.commit()
+    conn.close()
+
+
 @bot.message_handler(func=lambda message: message.text == 'Посмотреть список выполненных дел')
 def show_completed_reminders(message):
     user_id = message.from_user.id
