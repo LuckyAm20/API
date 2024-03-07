@@ -1,5 +1,8 @@
-import re
 import sqlite3
+import threading
+import time
+
+import schedule
 import telebot
 from telebot import types
 from telegram_bot_calendar import DetailedTelegramCalendar, LSTEP
@@ -14,11 +17,12 @@ from datetime import datetime
 
 load_dotenv()
 bot = telebot.TeleBot(os.getenv("TELEGRAM_API_TOKEN"))
-
+user_schedules = {}
 values = None
 value_new = None
 flag = False
 ind = None
+
 
 def create_user_reminders_table(user_id):
     conn = sqlite3.connect('reminders.db')
@@ -28,8 +32,9 @@ def create_user_reminders_table(user_id):
                   description TEXT,
                   date TEXT,
                   attachment_folder INTEGER DEFAULT 0,
-                  done INTEGER DEFAULT 0),
-                  period INTEGER DEFAULT 0''')
+                  done INTEGER DEFAULT 0,
+                  period INTEGER DEFAULT 0,
+                  periodic_time TEXT DEFAULT '0000-00-07 00:00')''')
     conn.commit()
     conn.close()
 
@@ -262,14 +267,22 @@ def handle_edit_date_query(query):
 def process_edit_date(message, user_id, reminder_id):
     global value_new
     msg = bot.send_message(message.chat.id, "Теперь введите новое время (в формате ЧЧ:ММ):")
-    bot.register_next_step_handler(msg, lambda m: process_edit_time(m, user_id, reminder_id, value_new))
+    bot.register_next_step_handler(msg, lambda m: process_edit_date1(m, user_id, reminder_id, value_new))
+
+def process_edit_date1(message, user_id, reminder_id, value_new):
+    if not validate_time_format(message.text):
+        msg = bot.send_message(message.chat.id, "Неверный формат времени. Пожалуйста, введите время в формате HH:MM.")
+        bot.register_next_step_handler(msg, process_edit_date1,  user_id, reminder_id, value_new)
+    else:
+        process_edit_time(message, user_id, reminder_id, value_new)
 
 
 def process_edit_time(message, user_id, reminder_id, new_date):
     new_time = message.text
     new_datetime = f"{new_date} {new_time}"
     update_date(user_id, reminder_id, new_datetime)
-    bot.send_message(message.chat.id, "Дата и время успешно обновлены.")
+    msg = bot.send_message(message.chat.id, "Дата и время успешно обновлены.")
+    process_return(msg)
 
 
 def update_date(user_id, reminder_id, new_date):
@@ -285,7 +298,8 @@ def show_completed_reminders(message):
     user_id = message.from_user.id
     reminders = get_user_reminders(user_id, done=True)
     if reminders:
-        for reminder in reminders:
+        reminders_sorted = sorted(reminders, key=lambda x: datetime.strptime(x[2], '%Y-%m-%d %H:%M'), reverse=True)
+        for reminder in reminders_sorted:
             keyboard = types.InlineKeyboardMarkup()
             keyboard.row(
                 types.InlineKeyboardButton("Вернуть с изменением даты", callback_data=f"return_{reminder[0]}")
@@ -303,7 +317,6 @@ def handle_return_query(query):
     calendar, step = DetailedTelegramCalendar().build()
     msg = bot.send_message(query.message.chat.id, "Выберите новую дату:", reply_markup=calendar)
     process_edit_date(msg, user_id, reminder_id)
-    bot.register_next_step_handler(msg, process_return)
 
 
 def process_return(message):
@@ -320,6 +333,7 @@ def start(message):
         "Для добавления нового напоминания используй команду /add.\n"
         "Приятного использования!"
     )
+    add_user_schedule(user.id, 1)
     bot.send_message(message.chat.id, welcome_message)
     send_main_menu(message)
 
@@ -562,7 +576,48 @@ def end_command_handler():
     flag = False
 
 
+def check_reminders(user_id):
+    reminders = get_user_reminders(user_id)
+    current_time = datetime.now()
+    for reminder in reminders:
+        reminder_time = datetime.strptime(reminder[2], "%Y-%m-%d %H:%M")
+        if current_time >= reminder_time:
+            message = f"Напоминание: {reminder[1]}"
+            attachment_table_name = f"attachments_{user_id}_{reminder[0]}"
+            files_info = get_all_files_info_from_database(attachment_table_name)
+            files = []
+            if files_info:
+
+                message += "\nВложения:"
+                for file_info in files_info:
+                    file_id, save_path = file_info
+                    files.append([file_id, save_path])
+                    message += f"\n{save_path}"
+
+            bot.send_message(user_id, message)
+            for el in files:
+                service = connect_to_drive()
+
+                download_file_from_drive(service, el[0], el[1])
+                with open(el[1], "rb") as file:
+                    bot.send_document(user_id, file)
+
+                os.remove(el[1])
+            mark_as(user_id, reminder[0])
+
+
+def add_user_schedule(user_id, interval_minutes):
+    user_schedules[user_id] = schedule.every(interval_minutes).minutes.do(check_reminders, user_id)
+
+def start_check_reminders():
+    while True:
+        schedule.run_pending()
+        time.sleep(15)
+
+
 def main():
+    reminder_thread = threading.Thread(target=start_check_reminders)
+    reminder_thread.start()
     bot.polling()
 
 
