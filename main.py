@@ -1,20 +1,20 @@
+import os
 import re
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta
 
 import schedule
 import telebot
-from telebot import types
-from telegram_bot_calendar import DetailedTelegramCalendar, LSTEP
 from dotenv import load_dotenv
-import os
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-from datetime import datetime, timedelta
+from telebot import types
+from telegram_bot_calendar import LSTEP, DetailedTelegramCalendar
 
 load_dotenv()
 bot = telebot.TeleBot(os.getenv("TELEGRAM_API_TOKEN"))
