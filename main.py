@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import threading
 import time
@@ -13,7 +14,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-from datetime import datetime
+from datetime import datetime, timedelta
 
 load_dotenv()
 bot = telebot.TeleBot(os.getenv("TELEGRAM_API_TOKEN"))
@@ -34,16 +35,16 @@ def create_user_reminders_table(user_id):
                   attachment_folder INTEGER DEFAULT 0,
                   done INTEGER DEFAULT 0,
                   period INTEGER DEFAULT 0,
-                  periodic_time TEXT DEFAULT '0000-00-07 00:00')''')
+                  periodic_time TEXT DEFAULT '0 0 0')''')
     conn.commit()
     conn.close()
 
 
-def add_to_database(user_id, description, date, attachment_folder):
+def add_to_database(user_id, description, date, attachment_folder, period):
     conn = sqlite3.connect('reminders.db')
     c = conn.cursor()
-    c.execute(f"INSERT INTO user_{user_id} (description, date, attachment_folder) VALUES (?, ?, ?)",
-              (description, date, attachment_folder))
+    c.execute(f"INSERT INTO user_{user_id} (description, date, attachment_folder, period) VALUES (?, ?, ?, ?)",
+              (description, date, attachment_folder, period))
     conn.commit()
     conn.close()
 
@@ -90,22 +91,29 @@ def show_current_reminders(message):
                 types.InlineKeyboardButton("Удалить", callback_data=f"delete_{reminder[0]}"),
                 types.InlineKeyboardButton("Выполнено", callback_data=f"complete_{reminder[0]}")
             )
-            bot.send_message(message.chat.id, f"Описание: {reminder[1]}, Дата: {reminder[2]}", reply_markup=keyboard)
+            if reminder[5] and reminder[6] != '0 0 0':
+                keyboard.row(
+                    types.InlineKeyboardButton("Редактировать периодичность", callback_data=f"edit_period_{reminder[0]}"))
+                bot.send_message(message.chat.id,
+                                 f"Периодическое напоминание. Описание: {reminder[1]}, Дата: {reminder[2]}. Период: {reminder[6]}",
+                                 reply_markup=keyboard)
+            elif reminder[5]:
+                bot.send_message(message.chat.id,
+                                 f"Текущее периодическое напоминание. Описание: {reminder[1]}, Дата: {reminder[2]}.",
+                                 reply_markup=keyboard)
+            else:
+                bot.send_message(message.chat.id, f"Описание: {reminder[1]}, Дата: {reminder[2]}",
+                                 reply_markup=keyboard)
     else:
         bot.send_message(message.chat.id, "У вас пока нет текущих дел.")
 
-# @bot.callback_query_handler(func=lambda call: call.data.startswith('edit_files'))
-# def edit_file_handler(call):
-#     user_id = call.from_user.id
-#     reminder_id = call.data.split('_')[2]  # Получаем идентификатор напоминания из данных вызова
-#     chat_id = call.message.chat.id
-#     bot.send_message(chat_id, "Чтобы отредактировать файл, отправьте новую версию файла.")
-#     attachment_table_name = f"attachments_{user_id}_{reminder_id}"
-#     file_id, save_path = get_file_info_from_database(attachment_table_name)
-#     service = connect_to_drive()
-#
-#     download_file_from_drive(service, file_id, save_path)
-#     print("Файл успешно загружен.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("edit_period_"))
+def handle_edit_period_query(query):
+    user_id = query.from_user.id
+    reminder_id = int(query.data.split("_")[2])
+    msg = bot.send_message(query.message.chat.id, "Укажите новую периодичность напоминания:")
+    bot.register_next_step_handler(msg, lambda m: ask_periodic_interval(m, reminder_id, True))
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('edit_files'))
@@ -115,7 +123,11 @@ def edit_files_handler(call):
     chat_id = call.message.chat.id
 
     attachment_table_name = f"attachments_{user_id}_{reminder_id}"
-    files_info = get_all_files_info_from_database(attachment_table_name)
+    try:
+        files_info = get_all_files_info_from_database(attachment_table_name)
+    except Exception:
+        bot.send_message(chat_id, "Нет вложенных файлов для редактирования.")
+        return
 
     if not files_info:
         bot.send_message(chat_id, "Нет вложенных файлов для редактирования.")
@@ -146,7 +158,7 @@ def get_all_files_info_from_database(table_name):
 def delete_file_handler(call):
     user_id = call.from_user.id
     reminder_id = call.data.split('_')[-1]
-    file_id = call.data[12:-len(reminder_id)-1]
+    file_id = call.data[12:-len(reminder_id) - 1]
     if delete_file_from_database(user_id, file_id, reminder_id):
         bot.send_message(call.message.chat.id, f"Файл с ID {file_id} успешно удален.")
     else:
@@ -175,7 +187,6 @@ def add_attachment_handler(call):
     global ind
     flag = True
     ind = call.data.split('_')[2]
-    print(ind)
     bot.send_message(call.message.chat.id, "Добавление нового вложения. После загрузки введите end")
 
 
@@ -218,7 +229,6 @@ def delete_reminder(user_id, reminder_id):
             file_ids = c.fetchall()
 
             for file_id in file_ids:
-
                 delete_file_from_drive(file_id[0])
 
             c.execute(f"DROP TABLE {attachment_table_name}")
@@ -269,10 +279,11 @@ def process_edit_date(message, user_id, reminder_id):
     msg = bot.send_message(message.chat.id, "Теперь введите новое время (в формате ЧЧ:ММ):")
     bot.register_next_step_handler(msg, lambda m: process_edit_date1(m, user_id, reminder_id, value_new))
 
+
 def process_edit_date1(message, user_id, reminder_id, value_new):
     if not validate_time_format(message.text):
         msg = bot.send_message(message.chat.id, "Неверный формат времени. Пожалуйста, введите время в формате HH:MM.")
-        bot.register_next_step_handler(msg, process_edit_date1,  user_id, reminder_id, value_new)
+        bot.register_next_step_handler(msg, process_edit_date1, user_id, reminder_id, value_new)
     else:
         process_edit_time(message, user_id, reminder_id, value_new)
 
@@ -304,7 +315,17 @@ def show_completed_reminders(message):
             keyboard.row(
                 types.InlineKeyboardButton("Вернуть с изменением даты", callback_data=f"return_{reminder[0]}")
             )
-            bot.send_message(message.chat.id, f"Описание: {reminder[1]}, Дата: {reminder[2]}", reply_markup=keyboard)
+            if reminder[5] and reminder[6] != '0 00:00':
+                bot.send_message(message.chat.id,
+                                 f"Периодическое напоминание. Описание: {reminder[1]}, Дата: {reminder[2]}. Период: {reminder[6]}",
+                                 reply_markup=keyboard)
+            elif reminder[5]:
+                bot.send_message(message.chat.id,
+                                 f"текущее периодическое напоминание. Описание: {reminder[1]}, Дата: {reminder[2]}.",
+                                 reply_markup=keyboard)
+            else:
+                bot.send_message(message.chat.id, f"Описание: {reminder[1]}, Дата: {reminder[2]}",
+                                 reply_markup=keyboard)
     else:
         bot.send_message(message.chat.id, "У вас пока нет выполненных дел.")
 
@@ -329,7 +350,7 @@ def start(message):
     create_user_reminders_table(user.id)
     welcome_message = (
         f"Привет, {user.first_name}!\n"
-        "Я бот напоминалка. Я могу помочь тебе организовать твои дела и напомнить о них в нужное время.\n"
+        "Я бот reminders. Я могу помочь тебе организовать твои дела и напомнить о них в нужное время.\n"
         "Для добавления нового напоминания используй команду /add.\n"
         "Приятного использования!"
     )
@@ -355,7 +376,7 @@ def cal(c):
                               c.message.chat.id,
                               c.message.message_id)
         if values is not None:
-            msg = bot.send_message(c.message.chat.id, f"Теперь выберите время:")
+            msg = bot.send_message(c.message.chat.id, f"Теперь выберите время в формате %H:%M")
             bot.register_next_step_handler(msg, set_time, result, values)
         else:
             value_new = result
@@ -379,7 +400,8 @@ def set_time(message, chosen_date, text):
             return
 
         reminder_time = f"{chosen_date} {time_chosen}"
-        msg = bot.send_message(chat_id, f"Вы выбрали время {time_chosen}. Напоминание будет установлено на {reminder_time}")
+        msg = bot.send_message(chat_id,
+                               f"Вы выбрали время {time_chosen}. Напоминание будет установлено на {reminder_time}")
         set_date(msg, text, reminder_time)
     except Exception:
         bot.send_message(message.chat.id, 'Ошибка выбора времени. Попробуйте еще раз.')
@@ -408,20 +430,83 @@ def set_date(message, description, result):
         try:
             chat_id = message.chat.id
             markup = telebot.types.InlineKeyboardMarkup()
-            markup.row(telebot.types.InlineKeyboardButton("Да", callback_data="attach_yes"),
-                       telebot.types.InlineKeyboardButton("Нет", callback_data="attach_no"))
+            markup.row(telebot.types.InlineKeyboardButton("Да", callback_data="periodic_yes"),
+                       telebot.types.InlineKeyboardButton("Нет", callback_data="periodic_no"))
             bot.send_message(chat_id, f"Напоминание '{description}' успешно добавлено на {result}."
-                                      "Хотите прикрепить вложения?", reply_markup=markup)
-            add_to_database(message.chat.id, description, result, 0)
+                                      "Хотите сделать его периодическим?", reply_markup=markup)
+            add_to_database(message.chat.id, description, result, 0, 0)
         except Exception as e:
             bot.send_message(message.chat.id, 'Ошибка выбора даты. Попробуйте еще раз.')
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'periodic_yes')
+def handle_periodic_yes(call):
+    chat_id = call.message.chat.id
+    bot.send_message(chat_id, "Укажите периодичность напоминания в формате days hours minutes '12 25 23'.")
+    bot.register_next_step_handler(call.message, ask_periodic_interval)
+
+
+def ask_periodic_interval(message, id=None, only_edit=False):
+    chat_id = message.chat.id
+    try:
+        pattern = r'^\d+ \d+ \d+$'
+        if not re.match(pattern, message.text):
+            raise ValueError
+        days, hour, minute = map(int, message.text.split())
+        if all(map(lambda x: x == 0, [days, hour, minute])):
+            raise ValueError
+        period = timedelta(hours=hour, minutes=minute, days=days)
+        bot.send_message(chat_id, f"Периодичное напоминание установлено с интервалом {period}.")
+        if id is None:
+            reminder_id = get_latest_reminder_id(chat_id)
+        else:
+            reminder_id = id
+        update_periodic_info(chat_id, reminder_id, message.text, 1)
+        if not only_edit:
+            ask_attachment(message, True)
+    except ValueError as e:
+        msg = bot.send_message(chat_id, "Неверный формат интервала. Пожалуйста, введите в формате days hours minutes '12 25 23'.")
+        bot.register_next_step_handler(msg, ask_periodic_interval)
+
+
+def update_periodic_info(user_id, reminder_id, periodic_time, period):
+    try:
+        conn = sqlite3.connect('reminders.db')
+        c = conn.cursor()
+        c.execute(f"UPDATE user_{user_id} SET period = ?, periodic_time = ? WHERE id = ?",
+                  (period, periodic_time, reminder_id))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.Error as e:
+        print("Ошибка при обновлении периодической информации в базе данных:", e)
+        return False
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'periodic_no')
+def handle_periodic_no(call):
+    chat_id = call.message.chat.id
+    bot.send_message(chat_id, "Напоминание будет одноразовым.")
+    ask_attachment(call.message)
+
+
+def ask_attachment(message, period=False):
+    chat_id = message.chat.id
+    markup = telebot.types.InlineKeyboardMarkup()
+    if period:
+        markup.row(telebot.types.InlineKeyboardButton("Да", callback_data="attach_yes_period"),
+               telebot.types.InlineKeyboardButton("Нет", callback_data="attach_no_period"))
+    else:
+        markup.row(telebot.types.InlineKeyboardButton("Да", callback_data="attach_yes"),
+                   telebot.types.InlineKeyboardButton("Нет", callback_data="attach_no"))
+    bot.send_message(chat_id, "Хотите прикрепить вложения к напоминанию?", reply_markup=markup)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('attach'))
 def handle_attachment(call):
     global flag
     chat_id = call.message.chat.id
-    if call.data == 'attach_yes':
+    if call.data.startswith('attach_yes'):
         reminder_id = get_latest_reminder_id(chat_id)
         create_attachments_table(chat_id, reminder_id)
         flag = True
@@ -429,8 +514,16 @@ def handle_attachment(call):
         update_attachment_folder(chat_id, 1)
         if msg.text == 'end':
             flag = False
-    elif call.data == 'attach_no':
+    elif call.data.startswith('attach_no'):
+        reminder = get_latest_reminder_id(chat_id)
+        if reminder:
+            reminder_info = get_reminder_info(chat_id, reminder)
+            if reminder_info:
+                if reminder_info[5]:
+                    new_date = reminder_info[2]
+                    add_to_database(chat_id, reminder_info[1], new_date, reminder_info[3], reminder_info[5])
         bot.send_message(chat_id, "Напоминание успешно создано!")
+
     bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
 
 
@@ -569,11 +662,40 @@ def delete_file_from_drive(file_id):
 
 
 @bot.message_handler(func=lambda message: message.text.lower() == 'end')
-def end_command_handler():
+def end_command_handler(message):
     global flag
     global ind
     ind = None
     flag = False
+    user_id = message.chat.id
+    reminder = get_latest_reminder_id(user_id)
+    if reminder:
+        reminder_info = get_reminder_info(user_id, reminder)
+        if reminder_info:
+            if reminder_info[5]:
+                new_date = reminder_info[2]
+                add_to_database(user_id, reminder_info[1], new_date, reminder_info[3], reminder_info[5])
+                if reminder_info[3] == 1:
+                    last_attachment_table_name = f"attachments_{user_id}_{reminder}"
+                    new_attachment_table_name = f"attachments_{user_id}_{reminder + 1}"
+                    copy_attachments(user_id, last_attachment_table_name, new_attachment_table_name)
+
+
+def copy_attachments(user_id, last_attachment_table_name, new_attachment_table_name):
+    conn = sqlite3.connect('reminders.db')
+    c = conn.cursor()
+    c.execute(f"CREATE TABLE IF NOT EXISTS {new_attachment_table_name} AS SELECT * FROM {last_attachment_table_name}")
+    conn.commit()
+    conn.close()
+
+
+def get_reminder_info(user_id, reminder_id):
+    conn = sqlite3.connect('reminders.db')
+    c = conn.cursor()
+    c.execute(f"SELECT * FROM user_{user_id} WHERE id = ?", (reminder_id,))
+    reminder_info = c.fetchone()
+    conn.close()
+    return reminder_info
 
 
 def check_reminders(user_id):
@@ -583,31 +705,46 @@ def check_reminders(user_id):
         reminder_time = datetime.strptime(reminder[2], "%Y-%m-%d %H:%M")
         if current_time >= reminder_time:
             message = f"Напоминание: {reminder[1]}"
+            if reminder[5] and reminder[6] != '0 0 0':
+                days, hour, minute = map(int, reminder[6].split())
+                period = timedelta(hours=hour, minutes=minute, days=days)
+                time = (datetime.strptime(reminder[2], "%Y-%m-%d %H:%M") + period).strftime("%Y-%m-%d %H:%M")
+                update_date(user_id, reminder[0], time)
+                add_to_database(user_id, reminder[1], time, reminder[3], reminder[5])
+                if reminder[3] == 1:
+                    last_attachment_table_name = f"attachments_{user_id}_{reminder[0]}"
+                    new_attachment_table_name = f"attachments_{user_id}_{reminder[0] + 1}"
+                    copy_attachments(user_id, last_attachment_table_name, new_attachment_table_name)
+                continue
             attachment_table_name = f"attachments_{user_id}_{reminder[0]}"
-            files_info = get_all_files_info_from_database(attachment_table_name)
-            files = []
-            if files_info:
+            if reminder[3]:
+                files_info = get_all_files_info_from_database(attachment_table_name)
+                files = []
+                if files_info:
 
-                message += "\nВложения:"
-                for file_info in files_info:
-                    file_id, save_path = file_info
-                    files.append([file_id, save_path])
-                    message += f"\n{save_path}"
+                    message += "\nВложения:"
+                    for file_info in files_info:
+                        file_id, save_path = file_info
+                        files.append([file_id, save_path])
+                        message += f"\n{save_path}"
 
-            bot.send_message(user_id, message)
-            for el in files:
-                service = connect_to_drive()
+                bot.send_message(user_id, message)
+                for el in files:
+                    service = connect_to_drive()
 
-                download_file_from_drive(service, el[0], el[1])
-                with open(el[1], "rb") as file:
-                    bot.send_document(user_id, file)
+                    download_file_from_drive(service, el[0], el[1])
+                    with open(el[1], "rb") as file:
+                        bot.send_document(user_id, file)
 
-                os.remove(el[1])
+                    os.remove(el[1])
+            else:
+                bot.send_message(user_id, message)
             mark_as(user_id, reminder[0])
 
 
 def add_user_schedule(user_id, interval_minutes):
     user_schedules[user_id] = schedule.every(interval_minutes).minutes.do(check_reminders, user_id)
+
 
 def start_check_reminders():
     while True:
@@ -626,8 +763,3 @@ if __name__ == '__main__':
         main()
     except Exception:
         main()
-
-
-
-
-
