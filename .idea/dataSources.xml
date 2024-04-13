@@ -2,7 +2,7 @@
 <project version="4">
   <component name="DataSourceManagerImpl" format="xml" multifile-model="true">
     <data-source source="LOCAL" name="reminders" uuid="d4c4c0d4-7797-45a4-940c-be855061a9e4">
-      <driver-ref>sqlite.xerial</driver-ref>
+      <driver-ref>b66f10a4-a821-4326-a20e-060a9396f21a</driver-ref>
       <synchronize>true</synchronize>
       <jdbc-driver>org.sqlite.JDBC</jdbc-driver>
       <jdbc-url>jdbc:sqlite:C:\Users\Misha\Documents\API\API_lab1\reminders.db</jdbc-url>

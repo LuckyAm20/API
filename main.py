@@ -112,7 +112,7 @@ def show_current_reminders(message):
 def handle_edit_period_query(query):
     user_id = query.from_user.id
     reminder_id = int(query.data.split("_")[2])
-    msg = bot.send_message(query.message.chat.id, "Укажите новую периодичность напоминания:")
+    msg = bot.send_message(query.message.chat.id, "Укажите новую периодичность напоминания в формате days hours minutes (5 2 2):")
     bot.register_next_step_handler(msg, lambda m: ask_periodic_interval(m, reminder_id, True))
 
 
@@ -282,7 +282,7 @@ def process_edit_date(message, user_id, reminder_id):
 
 def process_edit_date1(message, user_id, reminder_id, value_new):
     if not validate_time_format(message.text):
-        msg = bot.send_message(message.chat.id, "Неверный формат времени. Пожалуйста, введите время в формате HH:MM.")
+        msg = bot.send_message(message.chat.id, "Неверный формат времени. Пожалуйста, введите время в формате ЧЧ:ММ.")
         bot.register_next_step_handler(msg, process_edit_date1, user_id, reminder_id, value_new)
     else:
         process_edit_time(message, user_id, reminder_id, value_new)
@@ -334,9 +334,9 @@ def show_completed_reminders(message):
 def handle_return_query(query):
     user_id = query.from_user.id
     reminder_id = int(query.data.split("_")[1])
-    mark_as(user_id, reminder_id, 0)
     calendar, step = DetailedTelegramCalendar().build()
     msg = bot.send_message(query.message.chat.id, "Выберите новую дату:", reply_markup=calendar)
+    mark_as(user_id, reminder_id, 0)
     process_edit_date(msg, user_id, reminder_id)
 
 
@@ -376,7 +376,7 @@ def cal(c):
                               c.message.chat.id,
                               c.message.message_id)
         if values is not None:
-            msg = bot.send_message(c.message.chat.id, f"Теперь выберите время в формате %H:%M")
+            msg = bot.send_message(c.message.chat.id, f"Теперь выберите время в формате ЧЧ:ММ")
             bot.register_next_step_handler(msg, set_time, result, values)
         else:
             value_new = result
@@ -395,7 +395,7 @@ def set_time(message, chosen_date, text):
         chat_id = message.chat.id
         time_chosen = message.text
         if not validate_time_format(time_chosen):
-            msg = bot.send_message(chat_id, "Неверный формат времени. Пожалуйста, введите время в формате HH:MM.")
+            msg = bot.send_message(chat_id, "Неверный формат времени. Пожалуйста, введите время в формате ЧЧ:ММ.")
             bot.register_next_step_handler(msg, set_time, chosen_date, text)
             return
 
@@ -596,7 +596,7 @@ def save_file_info_to_database(user_id, reminder_id, file_path, file_name):
     conn.close()
 
 
-@bot.message_handler(content_types=['document'])
+@bot.message_handler(content_types=['audio', 'video', 'document'])
 def handle_document(message):
     global flag
     global ind
@@ -749,7 +749,7 @@ def add_user_schedule(user_id, interval_minutes):
 def start_check_reminders():
     while True:
         schedule.run_pending()
-        time.sleep(15)
+        time.sleep(30)
 
 
 def main():
